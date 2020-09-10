@@ -60,6 +60,7 @@
 
 #ifdef MYSQLI_USE_MYSQLND
 #include "ext/mysqli/php_mysqli_structs.h"
+#include "ext/mysqlnd/mysqlnd_structs.h"
 #endif
 
 /* If you declare any globals in php_skywalking.h uncomment this:
@@ -415,6 +416,9 @@ ZEND_API void sky_execute_internal(zend_execute_data *execute_data, zval *return
         return;
     }
 
+
+
+
     zend_function *zf = execute_data->func;
     const char *class_name = (zf->common.scope != NULL && zf->common.scope->name != NULL) ? ZSTR_VAL(
             zf->common.scope->name) : NULL;
@@ -426,7 +430,20 @@ ZEND_API void sky_execute_internal(zend_execute_data *execute_data, zval *return
     char *component = NULL;
     int componentId = COMPONENT_MYSQL_JDBC_DRIVER;
     if (class_name != NULL) {
-        if (strcmp(class_name, "PDO") == 0) {
+      //  php_printf("\t%s:\t%s\n",class_name,function_name);
+        if(strcmp(class_name,"mysqli_stmt") == 0){
+
+            //增加监控mysqli_stmt的execute函数
+            if(strcmp(function_name,"execute") == 0){
+                component = (char *) emalloc(strlen("mysqli_stmt") + 1);
+                strcpy(component, "mysqli_stmt");
+                operationName = (char *) emalloc(strlen(class_name) + strlen(function_name) + 3);
+                strcpy(operationName, class_name);
+                strcat(operationName, "->");
+                strcat(operationName, function_name);
+            }
+        }
+        else if (strcmp(class_name, "PDO") == 0) {
             if (strcmp(function_name, "exec") == 0
                 || strcmp(function_name, "query") == 0
                 || strcmp(function_name, "prepare") == 0
@@ -455,6 +472,16 @@ ZEND_API void sky_execute_internal(zend_execute_data *execute_data, zval *return
                 strcpy(operationName, class_name);
                 strcat(operationName, "->");
                 strcat(operationName, function_name);
+            }
+            if(strcmp(function_name, "prepare") == 0){// //增加监控mysqli的prepare函数
+                component = (char *) emalloc(strlen("mysqli_stmt") + 1);
+                strcpy(component, "mysqli_stmt");
+                operationName = (char *) emalloc(strlen(class_name) + strlen(function_name) + 3);
+                strcpy(operationName, class_name);
+                strcat(operationName, "->");
+                strcat(operationName, function_name);
+
+
             }
         } else if (strcmp(class_name, "Yar_Client") == 0) {
             if (strcmp(function_name, "__call") == 0) {
@@ -512,7 +539,6 @@ ZEND_API void sky_execute_internal(zend_execute_data *execute_data, zval *return
             strcpy(operationName, class_name);
             strcat(operationName, "->");
             strcat(operationName, function_name);
-
             is_procedural_mysqli = 1;
         }
     }
@@ -522,6 +548,11 @@ ZEND_API void sky_execute_internal(zend_execute_data *execute_data, zval *return
         zval tags;
         array_init(&tags);
 
+        if(strcmp(class_name,"mysqli_stmt") == 0){
+            add_assoc_string(&tags, "db.type", "mysql");
+            add_assoc_string(&tags, "db.statement", "sql未知,参考最近的mysqli->prepare");
+
+        }else 
         if (strcmp(class_name, "PDO") == 0) {
 
             // params
@@ -536,7 +567,6 @@ ZEND_API void sky_execute_internal(zend_execute_data *execute_data, zval *return
 
                 }
             }
-
             char db_type[64] = {0};
             pdo_dbh_t *dbh = Z_PDO_DBH_P(&(execute_data->This));
             if (dbh != NULL) {
@@ -625,6 +655,56 @@ ZEND_API void sky_execute_internal(zend_execute_data *execute_data, zval *return
                     }
                 }
             }
+            if (strcmp(function_name, "prepare") == 0) {
+
+#ifdef MYSQLI_USE_MYSQLND
+                mysqli_object *mysqli = NULL;
+                if(is_procedural_mysqli) {
+                    mysqli = (mysqli_object *) Z_MYSQLI_P(ZEND_CALL_ARG(execute_data, 1));
+                } else {
+                    mysqli = (mysqli_object *) Z_MYSQLI_P(&(execute_data->This));
+                }
+
+                MYSQLI_RESOURCE *my_res = (MYSQLI_RESOURCE *) mysqli->ptr;
+                if (my_res && my_res->ptr) {
+                    MY_MYSQL *mysql = (MY_MYSQL *) my_res->ptr;
+                    if (mysql->mysql) {
+#if PHP_VERSION_ID >= 70100
+                        char *host = mysql->mysql->data->hostname.s;
+#else
+                        char *host = mysql->mysql->data->host;
+#endif
+                        char port[6];
+                        sprintf(port, "%d", mysql->mysql->data->port);
+                        add_assoc_string(&tags, "db.host", host);
+                        add_assoc_string(&tags, "db.port", port);
+                        peer = (char *) emalloc(strlen(host) + 10);
+                        bzero(peer, strlen(host) + 10);
+                        sprintf(peer, "%s:%d", host, mysql->mysql->data->port);
+                    }
+                }
+#endif
+                add_assoc_string(&tags, "db.type", "mysql");
+                // params
+                uint32_t arg_count = ZEND_CALL_NUM_ARGS(execute_data);
+                if (arg_count) {
+                    zval *p = is_procedural_mysqli ? ZEND_CALL_ARG(execute_data, 2) : ZEND_CALL_ARG(execute_data, 1);
+                    //db.statement
+                    switch (Z_TYPE_P(p)) {
+                        case IS_STRING:
+                            add_assoc_string(&tags, "db.statement", Z_STRVAL_P(p));
+                            break;
+
+                    }
+                }
+
+
+
+
+               
+              //  php_printf("class_name:%s operationName:%s arg_count:%d\n",class_name,operationName,arg_count);
+            }
+
         } else if (strcmp(class_name, "Yar_Client") == 0) {
             if (strcmp(function_name, "__call") == 0) {
                 zval rv, _uri;
@@ -767,7 +847,7 @@ ZEND_API void sky_execute_internal(zend_execute_data *execute_data, zval *return
         add_assoc_long(&temp, "startTime", millisecond);
         add_assoc_long(&temp, "spanType", 1);
         add_assoc_long(&temp, "spanLayer", 1);
-//        add_assoc_string(&temp, "component", component);
+      // add_assoc_string(&temp, "component", component);
         add_assoc_long(&temp, "componentId", componentId);
         add_assoc_string(&temp, "operationName", operationName);
         add_assoc_string(&temp, "peer", peer == NULL ? "" : peer);
